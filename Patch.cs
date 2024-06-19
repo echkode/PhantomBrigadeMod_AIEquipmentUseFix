@@ -10,6 +10,8 @@ using PhantomBrigade.AI;
 using PhantomBrigade.AI.Systems;
 using PhantomBrigade.Data;
 
+using UnityEngine;
+
 namespace EchKode.PBMods.AIEquipmentUseFix
 {
 	[HarmonyPatch]
@@ -19,50 +21,48 @@ namespace EchKode.PBMods.AIEquipmentUseFix
 		[HarmonyTranspiler]
 		static IEnumerable<CodeInstruction> Caibis_Transpiler(IEnumerable<CodeInstruction> instructions, ILGenerator generator)
 		{
+			// The combat AI treats eject as a use equipment action but the combat action does not have a dataEquipment section.
+			// We have to move the null check so that it's not a condition for an early return but instead guards the call to
+			// EquipmentUtility.GetPartInUnit() where the dataEquipment section is consulted for the socket.
+
 			var cm = new CodeMatcher(instructions, generator);
-			var getActionFromTableMethodInfo = AccessTools.DeclaredMethod(typeof(AIUtility), nameof(AIUtility.GetActionFromTable));
-			var getPaintedActionDurationMethodInfo = AccessTools.DeclaredMethod(typeof(DataHelperAction), nameof(DataHelperAction.GetPaintedActionDuration), new System.Type[]
+			var isPlannedActionMethodInfo = AccessTools.DeclaredMethod(typeof(AIUtility), nameof(AIUtility.IsPlannedActionUIDValid));
+			var getPartMethodInfo = AccessTools.DeclaredMethod(typeof(EquipmentUtility), nameof(EquipmentUtility.GetPartInUnit));
+			var logErrorMethodInfo = AccessTools.DeclaredMethod(typeof(Debug), nameof(Debug.LogError), new System.Type[]
 			{
-				typeof(string),
-				typeof(PersistentEntity),
-				typeof(EquipmentEntity),
+				typeof(object),
 			});
-			var getActionFromTableMatch = new CodeMatch(OpCodes.Call, getActionFromTableMethodInfo);
-			var getPaintedActionDurationMatch = new CodeMatch(OpCodes.Call, getPaintedActionDurationMethodInfo);
-			var retMatch = new CodeMatch(OpCodes.Ret);
-			var dupe = new CodeInstruction(OpCodes.Dup);
-			var callGetPart = CodeInstruction.Call(typeof(Patch), nameof(GetPart));
-			var callGetPaintedActionDuration = CodeInstruction.Call(typeof(DataHelperAction), nameof(DataHelperAction.GetPaintedActionDuration), new System.Type[]
-			{
-				typeof(DataContainerAction),
-				typeof(PersistentEntity),
-				typeof(EquipmentEntity),
-			});
+			var isPlannedActionMatch = new CodeMatch(OpCodes.Call, isPlannedActionMethodInfo);
+			var getPartMatch = new CodeMatch(OpCodes.Call, getPartMethodInfo);
+			var logErrorMatch = new CodeMatch(OpCodes.Call, logErrorMethodInfo);
+			var loadDataEquipment = CodeInstruction.LoadField(typeof(DataContainerAction), nameof(DataContainerAction.dataEquipment));
+			var loadNull = new CodeInstruction(OpCodes.Ldnull);
 
 			cm.Start()
-				.MatchEndForward(getActionFromTableMatch)
-				.MatchEndForward(retMatch)
-				.Advance(5);
-			var loadActionData = cm.Instruction.Clone();
-			cm.MatchStartForward(getPaintedActionDurationMatch)
-				.Advance(-3)
-				.SetInstructionAndAdvance(loadActionData)
+				.MatchStartForward(isPlannedActionMatch)
+				.Advance(-7);
+			var loadEntry = cm.Instruction.Clone();
+			cm.Advance(-1)
+				.RemoveInstructions(3)
+				.MatchEndForward(getPartMatch)
 				.Advance(1)
-				.InsertAndAdvance(dupe)
-				.InsertAndAdvance(loadActionData)
-				.SetInstructionAndAdvance(callGetPart)
-				.SetInstructionAndAdvance(callGetPaintedActionDuration);
+				.CreateLabel(out var storeLabel);
+			var jumpToStore = new CodeInstruction(OpCodes.Br_S, storeLabel);
+			cm.MatchEndBackwards(logErrorMatch)
+				.Advance(1);
+			var labels = new List<Label>(cm.Labels);
+			cm.Labels.Clear();
+			cm.CreateLabel(out var getPartLabel);
+			var skipToGetPart = new CodeInstruction(OpCodes.Brtrue_S, getPartLabel);
+			cm.Insert(loadEntry)
+				.AddLabels(labels)
+				.Advance(1)
+				.InsertAndAdvance(loadDataEquipment)
+				.InsertAndAdvance(skipToGetPart)
+				.InsertAndAdvance(loadNull)
+				.InsertAndAdvance(jumpToStore);
 
 			return cm.InstructionEnumeration();
-		}
-
-		public static EquipmentEntity GetPart(PersistentEntity unitPersistent, DataContainerAction actionData)
-		{
-			if (actionData.dataEquipment == null || !actionData.dataEquipment.partUsed)
-			{
-				return null;
-			}
-			return EquipmentUtility.GetPartInUnit(unitPersistent, actionData.dataEquipment.partSocket);
 		}
 	}
 }
